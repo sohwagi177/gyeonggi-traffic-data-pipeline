@@ -1,86 +1,115 @@
-import subprocess
-import sys
+import os
 import time
-from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import unquote
+
+import pandas as pd
+import requests
+from dotenv import load_dotenv
+
+# 동기 수집 코드에서 이미 만든 기능 재사용
+from sync_collect import FIELDS, get_link_ids, get_traffic
 
 
-# ① 배치 실행 설정
-RUN_COUNT = 3          # 총 수집 횟수
-INTERVAL_SECONDS = 60  # 수집 간격: 60초
+# ① 배치 설정
+BATCH_SIZE = 20   # 한 배치당 최대 20개
+BATCH_DELAY = 1   # 배치 사이 1초 대기
 
-# ② 프로젝트 경로와 실행할 비동기 수집 파일
 BASE_DIR = Path(__file__).resolve().parent
-COLLECTOR_FILE = BASE_DIR / "async_collect.py"
+OUTPUT_DIR = BASE_DIR / "data" / "raw"
 
 
-def run_collection(run_number: int) -> bool:
-    """③ async_collect.py를 한 번 실행한다."""
-    started_at = datetime.now()
+def chunks(data, size):
+    """② 데이터를 size개씩 잘라서 반환"""
+    for i in range(0, len(data), size):
+        yield data[i:i + size]
 
-    print("\n" + "=" * 60)
-    print(f"{run_number}/{RUN_COUNT}회차 수집 시작")
-    print(f"시작 시각: {started_at:%Y-%m-%d %H:%M:%S}")
-    print("=" * 60)
 
-    # 현재 가상환경의 Python으로 비동기 수집기 실행
-    result = subprocess.run(
-        [sys.executable, str(COLLECTOR_FILE)],
-        cwd=BASE_DIR,
+def main():
+    # ③ .env에서 API Key 불러오기
+    load_dotenv(BASE_DIR / ".env")
+    service_key = unquote(os.getenv("SERVICE_KEY", "").strip())
+
+    if not service_key:
+        raise ValueError(".env 파일에 SERVICE_KEY가 없습니다.")
+
+    start_time = time.perf_counter()
+
+    records = []
+    no_data = []
+    failed = []
+
+    with requests.Session() as session:
+        # ④ 전체 linkId 조회
+        link_ids = get_link_ids(session, service_key)
+
+        # ⑤ 20개씩 배치로 나누기
+        batches = list(chunks(link_ids, BATCH_SIZE))
+
+        print(f"전체 구간: {len(link_ids)}개")
+        print(f"배치 크기: {BATCH_SIZE}개")
+        print(f"전체 배치: {len(batches)}개\n")
+
+        # ⑥ 배치별로 순서대로 수집
+        for batch_num, batch in enumerate(batches, start=1):
+            print(
+                f"===== 배치 {batch_num}/{len(batches)} "
+                f"({len(batch)}개) ====="
+            )
+
+            for link_id in batch:
+                try:
+                    traffic = get_traffic(
+                        session,
+                        service_key,
+                        link_id,
+                    )
+
+                    if traffic:
+                        records.append(traffic)
+                        print(f"{link_id} 수집 성공")
+                    else:
+                        no_data.append(link_id)
+                        print(f"{link_id} 데이터 없음")
+
+                except Exception as error:
+                    failed.append(link_id)
+                    print(f"{link_id} 수집 실패: {error}")
+
+            # ⑦ 마지막 배치가 아니면 잠시 대기
+            if batch_num < len(batches):
+                print(f"{BATCH_DELAY}초 대기\n")
+                time.sleep(BATCH_DELAY)
+
+    # ⑧ 모든 배치 결과를 CSV 하나로 저장
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    output_path = (
+        OUTPUT_DIR
+        / f"bundang_suseo_batch_{timestamp}.csv"
     )
 
-    finished_at = datetime.now()
+    pd.DataFrame(
+        records,
+        columns=FIELDS.keys(),
+    ).to_csv(
+        output_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
 
-    if result.returncode == 0:
-        print(f"{run_number}회차 수집 완료")
-        print(f"종료 시각: {finished_at:%Y-%m-%d %H:%M:%S}")
-        return True
+    elapsed = time.perf_counter() - start_time
 
-    print(f"{run_number}회차 수집 실패")
-    print(f"종료 코드: {result.returncode}")
-    return False
-
-
-def main() -> None:
-    """④ 일정한 간격으로 비동기 수집기를 반복 실행한다."""
-    if not COLLECTOR_FILE.exists():
-        raise FileNotFoundError(
-            "async_collect.py 파일을 찾을 수 없습니다."
-        )
-
-    success_count = 0
-    failed_count = 0
-
-    print("분당수서로 배치 수집을 시작합니다.")
-    print(f"수집 횟수: {RUN_COUNT}회")
-    print(f"수집 간격: {INTERVAL_SECONDS}초")
-
-    for run_number in range(1, RUN_COUNT + 1):
-        if run_collection(run_number):
-            success_count += 1
-        else:
-            failed_count += 1
-
-        # 마지막 실행 후에는 기다리지 않음
-        if run_number < RUN_COUNT:
-            next_time = datetime.now() + timedelta(
-                seconds=INTERVAL_SECONDS
-            )
-
-            print()
-            print(
-                f"다음 수집 예정 시각: "
-                f"{next_time:%Y-%m-%d %H:%M:%S}"
-            )
-            print(f"{INTERVAL_SECONDS}초 동안 대기합니다.")
-
-            time.sleep(INTERVAL_SECONDS)
-
-    print("\n" + "=" * 60)
-    print("배치 수집 종료")
-    print(f"성공: {success_count}회")
-    print(f"실패: {failed_count}회")
-    print("=" * 60)
+    # ⑨ 최종 결과
+    print("\n" + "=" * 50)
+    print(f"CSV 저장 완료: {output_path}")
+    print(f"전체 구간: {len(link_ids)}건")
+    print(f"전체 배치: {len(batches)}개")
+    print(f"수집 성공: {len(records)}건")
+    print(f"데이터 없음: {len(no_data)}건")
+    print(f"요청 실패: {len(failed)}건")
+    print(f"전체 실행시간: {elapsed:.2f}초")
 
 
 if __name__ == "__main__":
