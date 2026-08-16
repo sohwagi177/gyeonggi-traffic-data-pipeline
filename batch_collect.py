@@ -1,37 +1,34 @@
-import os
 import time
-from pathlib import Path
-from urllib.parse import unquote
 
-import pandas as pd
 import requests
-from dotenv import load_dotenv
 
-# 동기 수집 코드에서 이미 만든 기능 재사용
-from sync_collect import FIELDS, get_link_ids, get_traffic
+from traffic import (
+    load_service_key,
+    save_records,
+)
 
-
-# ① 배치 설정
-BATCH_SIZE = 20   # 한 배치당 최대 20개
-BATCH_DELAY = 1   # 배치 사이 1초 대기
-
-BASE_DIR = Path(__file__).resolve().parent
-OUTPUT_DIR = BASE_DIR / "data" / "raw"
-
-
-def chunks(data, size):
-    """② 데이터를 size개씩 잘라서 반환"""
-    for i in range(0, len(data), size):
-        yield data[i:i + size]
+# ① 성남시 대상 LINK_ID와 동기 교통정보 조회 함수 재사용
+from sync_collect import (
+    load_target_link_ids,
+    get_traffic,
+)
 
 
-def main():
-    # ③ .env에서 API Key 불러오기
-    load_dotenv(BASE_DIR / ".env")
-    service_key = unquote(os.getenv("SERVICE_KEY", "").strip())
+# ② 배치 설정
+BATCH_SIZE = 20
+BATCH_DELAY = 1
 
-    if not service_key:
-        raise ValueError(".env 파일에 SERVICE_KEY가 없습니다.")
+
+def main() -> None:
+    """③ 성남시 대상 링크를 20개씩 나누어 배치 수집한다."""
+
+    service_key = load_service_key()
+    link_ids = load_target_link_ids()
+
+    total = len(link_ids)
+    total_batches = (
+        total + BATCH_SIZE - 1
+    ) // BATCH_SIZE
 
     start_time = time.perf_counter()
 
@@ -39,21 +36,25 @@ def main():
     no_data = []
     failed = []
 
+    print(f"성남시 수집 대상: {total}개")
+    print(f"배치 크기: {BATCH_SIZE}개")
+    print(f"전체 배치: {total_batches}개")
+    print(f"배치 사이 대기: {BATCH_DELAY}초\n")
+
     with requests.Session() as session:
-        # ④ 전체 linkId 조회
-        link_ids = get_link_ids(session, service_key)
 
-        # ⑤ 20개씩 배치로 나누기
-        batches = list(chunks(link_ids, BATCH_SIZE))
+        # ④ 전체 LINK_ID를 20개씩 나누어 처리
+        for batch_num, start in enumerate(
+            range(0, total, BATCH_SIZE),
+            start=1,
+        ):
+            batch = link_ids[
+                start:start + BATCH_SIZE
+            ]
 
-        print(f"전체 구간: {len(link_ids)}개")
-        print(f"배치 크기: {BATCH_SIZE}개")
-        print(f"전체 배치: {len(batches)}개\n")
-
-        # ⑥ 배치별로 순서대로 수집
-        for batch_num, batch in enumerate(batches, start=1):
             print(
-                f"===== 배치 {batch_num}/{len(batches)} "
+                f"===== 배치 "
+                f"{batch_num}/{total_batches} "
                 f"({len(batch)}개) ====="
             )
 
@@ -67,49 +68,58 @@ def main():
 
                     if traffic:
                         records.append(traffic)
-                        print(f"{link_id} 수집 성공")
+                        result = "수집 성공"
+
                     else:
                         no_data.append(link_id)
-                        print(f"{link_id} 데이터 없음")
+                        result = "데이터 없음"
 
-                except Exception as error:
+                except (
+                    requests.RequestException,
+                    RuntimeError,
+                ) as error:
                     failed.append(link_id)
-                    print(f"{link_id} 수집 실패: {error}")
+                    result = (
+                        f"수집 실패: {error}"
+                    )
 
-            # ⑦ 마지막 배치가 아니면 잠시 대기
-            if batch_num < len(batches):
-                print(f"{BATCH_DELAY}초 대기\n")
+                print(
+                    f"{link_id} {result}"
+                )
+
+            # ⑤ 마지막 배치가 아니면 1초 대기
+            if batch_num < total_batches:
+                print(
+                    f"{BATCH_DELAY}초 대기\n"
+                )
                 time.sleep(BATCH_DELAY)
 
-    # ⑧ 모든 배치 결과를 CSV 하나로 저장
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    timestamp = time.strftime("%Y%m%d_%H%M%S")
-    output_path = (
-        OUTPUT_DIR
-        / f"bundang_suseo_batch_{timestamp}.csv"
-    )
-
-    pd.DataFrame(
+    # ⑥ 성남시 배치 결과를 Parquet으로 저장
+    output_path = save_records(
         records,
-        columns=FIELDS.keys(),
-    ).to_csv(
-        output_path,
-        index=False,
-        encoding="utf-8-sig",
+        "batch",
+        "seongnam",
     )
 
-    elapsed = time.perf_counter() - start_time
+    elapsed = (
+        time.perf_counter()
+        - start_time
+    )
 
-    # ⑨ 최종 결과
     print("\n" + "=" * 50)
-    print(f"CSV 저장 완료: {output_path}")
-    print(f"전체 구간: {len(link_ids)}건")
-    print(f"전체 배치: {len(batches)}개")
+    print(f"저장 완료: {output_path}")
+    print(f"전체 대상: {total}건")
+    print(f"전체 배치: {total_batches}개")
     print(f"수집 성공: {len(records)}건")
     print(f"데이터 없음: {len(no_data)}건")
     print(f"요청 실패: {len(failed)}건")
     print(f"전체 실행시간: {elapsed:.2f}초")
+
+    if failed:
+        print(
+            "실패한 linkId: "
+            + ", ".join(failed)
+        )
 
 
 if __name__ == "__main__":
